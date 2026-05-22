@@ -393,6 +393,7 @@ namespace ChessPlaceSolverGUI {
                this->Icon = (cli::safe_cast<System::Drawing::Icon^>(resources->GetObject(L"$this.Icon")));
                this->Name = L"MainForm";
                this->Text = L"Chess Place Solver";
+               this->Load += gcnew System::EventHandler(this, &MainForm::MainForm_Load_1);
                (cli::safe_cast<System::ComponentModel::ISupportInitialize^>(this->numericUpDown1))->EndInit();
                (cli::safe_cast<System::ComponentModel::ISupportInitialize^>(this->numericUpDown2))->EndInit();
                (cli::safe_cast<System::ComponentModel::ISupportInitialize^>(this->numericUpDown3))->EndInit();
@@ -440,5 +441,7 @@ namespace ChessPlaceSolverGUI {
     private: System::Void numericUpDown3_ValueChanged(System::Object^ sender, System::EventArgs^ e);
     private: System::Void textBox2_TextChanged(System::Object^ sender, System::EventArgs^ e);
     private: System::Void label9_Click(System::Object^ sender, System::EventArgs^ e);
+private: System::Void MainForm_Load_1(System::Object^ sender, System::EventArgs^ e) {
+}
 };
 }
