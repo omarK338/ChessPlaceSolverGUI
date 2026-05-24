@@ -10,6 +10,254 @@ using namespace System::Management;
 
 namespace ChessPlaceSolverGUI {
 
+    void MainForm::CalculateHardwareLimit()
+    {
+        // Step 1: Read hardware
+        unsigned long long AvailableRAMMB = 0;
+        unsigned long long CPUSpeedMHz = 0;
+
+        try
+        {
+            ManagementObjectSearcher^ RAMSearcher = gcnew ManagementObjectSearcher(
+                "SELECT FreePhysicalMemory FROM Win32_OperatingSystem");
+            for each(ManagementObject ^ Obj in RAMSearcher->Get())
+                AvailableRAMMB = Convert::ToUInt64(Obj["FreePhysicalMemory"]) / 1024;
+        }
+        catch (Exception^) { AvailableRAMMB = 512; }
+
+        try
+        {
+            ManagementObjectSearcher^ CPUSearcher = gcnew ManagementObjectSearcher(
+                "SELECT MaxClockSpeed FROM Win32_Processor");
+            for each(ManagementObject ^ Obj in CPUSearcher->Get())
+                CPUSpeedMHz = Convert::ToUInt64(Obj["MaxClockSpeed"]);
+        }
+        catch (Exception^) { CPUSpeedMHz = 2000; }
+
+        // Step 2: Run 200ms sample to measure solutions per second
+        SampleCallCount = 0;
+        SampleSolutionsFound = 0;
+        SampleRunning = true;
+
+        SampleBoard = gcnew array<int>(BoardHeight * BoardWidth);
+        SampleRows = gcnew array<int>(BoardHeight);
+        for (int i = 0; i < BoardHeight; i++) SampleRows[i] = -1;
+
+        Task^ SampleTask = Task::Run(gcnew Action(this, &MainForm::RunSampleForLimit));
+        Thread::Sleep(200);
+        SampleRunning = false;
+        LabelDragging = false;
+        LabelDragOffset = System::Drawing::Point(0, 0);
+        SampleTask->Wait(500);
+
+        double SolutionsPerSec = SampleSolutionsFound / 0.2;
+
+        // Step 3: Calculate RAM limit
+        // Each solution stores PieceCount Points, each Point is 8 bytes
+        long long MemPerSolution = static_cast<long long>(PieceCount) * sizeof(Point);
+        if (MemPerSolution < 1) MemPerSolution = 1;
+
+        long long RAMBudgetBytes = static_cast<long long>(
+            AvailableRAMMB * 1024.0 * 1024.0 * 0.75);
+        long long MaxByRAM = RAMBudgetBytes / MemPerSolution;
+
+        // Step 4: Calculate CPU limit
+        // 40% CPU over 30 seconds = 12 seconds of actual solver work
+        double   CPUBudgetSeconds = 30.0 * 0.40;
+        long long MaxByCPU = static_cast<long long>(
+            SolutionsPerSec * CPUBudgetSeconds);
+
+        // If sample found zero solutions, solver is either very slow or
+        // the problem has no solutions, set a conservative minimum
+        if (MaxByCPU < 1) MaxByCPU = 100;
+
+        // Step 5: Recommended limit is minimum of both constraints
+        long long RecommendedLimit = Math::Min(MaxByRAM, MaxByCPU);
+        RecommendedLimit = Math::Max(1LL, RecommendedLimit);
+        RecommendedLimit = Math::Min(100000LL, RecommendedLimit);
+
+        // Step 6: Store values then update UI on main thread
+        PendingMaxByRAM = MaxByRAM;
+        PendingMaxByCPU = MaxByCPU;
+        PendingRecommended = RecommendedLimit;
+        PendingAvailableRAM = static_cast<long long>(AvailableRAMMB);
+        PendingCPUSpeed = static_cast<long long>(CPUSpeedMHz);
+        PendingRate = SolutionsPerSec;
+        PendingMemPerSol = MemPerSolution;
+        this->Invoke(gcnew Action(this, &MainForm::UpdateLimitLabelUI));
+    }
+
+    void MainForm::RunSampleForLimit()
+    {
+        if (PieceType == "Queen")
+            SampleQueensForLimit(SampleRows, 0, PieceCount);
+        else if (PieceType == "Rook" || PieceType == "Bishop")
+            SamplePiecesForLimit(SampleBoard, 0, PieceCount);
+        else if (PieceType == "King")
+            SampleKingForLimit(SampleBoard, PieceCount);
+        else if (PieceType == "Knight")
+            SampleKnightForLimit(SampleBoard, PieceCount);
+    }
+
+    void MainForm::SampleQueensForLimit(array<int>^ Rows, int Row, int Remaining)
+    {
+        if (!SampleRunning) return;
+        SampleCallCount++;
+
+        if (Remaining == 0)
+        {
+            SampleSolutionsFound++;
+            return;
+        }
+        if (Row >= BoardHeight || Remaining > BoardHeight - Row) return;
+
+        for (int Col = 0; Col < BoardWidth; Col++)
+        {
+            if (!SampleRunning) return;
+            if (IsSafeQueen(Rows, Row, Col))
+            {
+                Rows[Row] = Col;
+                SampleQueensForLimit(Rows, Row + 1, Remaining - 1);
+                Rows[Row] = -1;
+            }
+        }
+    }
+
+    void MainForm::SamplePiecesForLimit(array<int>^ Board, int Index, int Remaining)
+    {
+        if (!SampleRunning) return;
+        SampleCallCount++;
+
+        if (Remaining == 0)
+        {
+            SampleSolutionsFound++;
+            return;
+        }
+        if (Index >= BoardHeight * BoardWidth ||
+            Remaining > BoardHeight * BoardWidth - Index) return;
+
+        int Row = Index / BoardWidth;
+        int Col = Index % BoardWidth;
+
+        if (IsSafe(Board, Row, Col))
+        {
+            Board[Index] = 1;
+            MarkAttacks(Row, Col, true);
+            SamplePiecesForLimit(Board, Index + 1, Remaining - 1);
+            Board[Index] = 0;
+            MarkAttacks(Row, Col, false);
+        }
+        SamplePiecesForLimit(Board, Index + 1, Remaining);
+    }
+
+    void MainForm::SampleKingForLimit(array<int>^ Board, int Remaining)
+    {
+        if (!SampleRunning) return;
+        SampleCallCount++;
+
+        if (Remaining == 0)
+        {
+            SampleSolutionsFound++;
+            return;
+        }
+
+        System::Collections::Generic::List<int>^ Candidates =
+            gcnew System::Collections::Generic::List<int>();
+
+        for (int i = 0; i < BoardHeight * BoardWidth; i++)
+            if (Board[i] == 0 && AvailableCount[i] == 0)
+                Candidates->Add(i);
+
+        CurrentBoard = Board;
+        SortByMRV(Candidates, false);
+
+        for (int Idx = 0; Idx < Candidates->Count; Idx++)
+        {
+            if (!SampleRunning) return;
+
+            int Index = Candidates[Idx];
+            int Row = Index / BoardWidth;
+            int Col = Index % BoardWidth;
+
+            Board[Index] = 1;
+            for (int Dr = -1; Dr <= 1; Dr++)
+                for (int Dc = -1; Dc <= 1; Dc++)
+                {
+                    if (Dr == 0 && Dc == 0) continue;
+                    int R = Row + Dr;
+                    int C = Col + Dc;
+                    if (R >= 0 && R < BoardHeight && C >= 0 && C < BoardWidth)
+                        AvailableCount[R * BoardWidth + C]++;
+                }
+
+            SampleKingForLimit(Board, Remaining - 1);
+
+            Board[Index] = 0;
+            for (int Dr = -1; Dr <= 1; Dr++)
+                for (int Dc = -1; Dc <= 1; Dc++)
+                {
+                    if (Dr == 0 && Dc == 0) continue;
+                    int R = Row + Dr;
+                    int C = Col + Dc;
+                    if (R >= 0 && R < BoardHeight && C >= 0 && C < BoardWidth)
+                        AvailableCount[R * BoardWidth + C]--;
+                }
+        }
+    }
+
+    void MainForm::SampleKnightForLimit(array<int>^ Board, int Remaining)
+    {
+        if (!SampleRunning) return;
+        SampleCallCount++;
+
+        if (Remaining == 0)
+        {
+            SampleSolutionsFound++;
+            return;
+        }
+
+        int KnightMoves[8][2] = { {-2,-1},{-2,1},{-1,-2},{-1,2},{1,-2},{1,2},{2,-1},{2,1} };
+
+        System::Collections::Generic::List<int>^ Candidates =
+            gcnew System::Collections::Generic::List<int>();
+
+        for (int i = 0; i < BoardHeight * BoardWidth; i++)
+            if (Board[i] == 0 && AvailableCount[i] == 0)
+                Candidates->Add(i);
+
+        CurrentBoard = Board;
+        SortByMRV(Candidates, true);
+
+        for (int Idx = 0; Idx < Candidates->Count; Idx++)
+        {
+            if (!SampleRunning) return;
+
+            int Index = Candidates[Idx];
+            int Row = Index / BoardWidth;
+            int Col = Index % BoardWidth;
+
+            Board[Index] = 1;
+            for (int M = 0; M < 8; M++)
+            {
+                int R = Row + KnightMoves[M][0];
+                int C = Col + KnightMoves[M][1];
+                if (R >= 0 && R < BoardHeight && C >= 0 && C < BoardWidth)
+                    AvailableCount[R * BoardWidth + C]++;
+            }
+
+            SampleKnightForLimit(Board, Remaining - 1);
+
+            Board[Index] = 0;
+            for (int M = 0; M < 8; M++)
+            {
+                int R = Row + KnightMoves[M][0];
+                int C = Col + KnightMoves[M][1];
+                if (R >= 0 && R < BoardHeight && C >= 0 && C < BoardWidth)
+                    AvailableCount[R * BoardWidth + C]--;
+            }
+        }
+    }
+
     bool MainForm::ValidateInput(String^& ErrorMessage)
     {
         if (comboBox1->SelectedItem == nullptr)
@@ -189,6 +437,7 @@ namespace ChessPlaceSolverGUI {
         button1->Enabled = false;
         button3->Enabled = false;
         button4->Enabled = false;
+        label10->Visible = false;
         textBox1->Text = "Solving...";
         textBox2->Text = "";
 
@@ -235,6 +484,28 @@ namespace ChessPlaceSolverGUI {
         CurrentSolutionIndex = (CurrentSolutionIndex + 1) % Solutions->Count;
         panel1->Invalidate();
         UpdateSolutionDisplay();
+    }
+
+    void MainForm::button5_Click(System::Object^ Sender, System::EventArgs^ E)
+    {
+        button5->Enabled = false;
+        label10->Text = "Analyzing hardware...";
+        label10->Visible = true;
+        label10->BringToFront();
+
+        BoardHeight = static_cast<int>(numericUpDown2->Value);
+        BoardWidth = static_cast<int>(numericUpDown3->Value);
+        PieceCount = static_cast<int>(numericUpDown1->Value);
+        PieceType = comboBox1->SelectedItem->ToString();
+
+        // Initialize attack maps for sample
+        AttackedRows = gcnew array<bool>(BoardHeight);
+        AttackedCols = gcnew array<bool>(BoardWidth);
+        AttackedDiagSum = gcnew array<bool>(BoardHeight + BoardWidth);
+        AttackedDiagDiff = gcnew array<bool>(BoardHeight + BoardWidth);
+        AvailableCount = gcnew array<int>(BoardHeight * BoardWidth);
+
+        Task::Run(gcnew Action(this, &MainForm::CalculateHardwareLimit));
     }
 
     void MainForm::Solve(String^ Type, int Count, int Height, int Width)
@@ -774,6 +1045,14 @@ namespace ChessPlaceSolverGUI {
         int MaxPieces = CalcMaxPieces();
         numericUpDown1->Maximum = MaxPieces;
         numericUpDown1->Value = 8;
+
+        numericUpDown4->Minimum = 1;
+        numericUpDown4->Maximum = 100000;
+        numericUpDown4->Value = 1000;
+        MAXSolutions = 1000;
+
+        button5->Enabled = true;
+        label10->BringToFront();
     }
 
     String^ MainForm::GetColumnLabel(int ColIndex)
@@ -817,7 +1096,7 @@ namespace ChessPlaceSolverGUI {
                 static_cast<float>(OffsetY + (BoardHeight - 1 - i) * CellSize + CellSize / 2 - 7));
         }
 
-        // Draw column labels using Excel-style naming
+        // Draw column labels using A-Z,AA-AZ,BA-BZ naming
         for (int j = 0; j < BoardWidth; j++)
         {
             String^ ColLabel = GetColumnLabel(j);
@@ -862,6 +1141,8 @@ namespace ChessPlaceSolverGUI {
         numericUpDown1->Maximum = MaxPieces;
         if (numericUpDown1->Value > MaxPieces)
             numericUpDown1->Value = MaxPieces;
+
+        button5->Enabled = true;
     }
 
     void MainForm::numericUpDown1_ValueChanged(System::Object^ sender, System::EventArgs^ e)
@@ -872,19 +1153,95 @@ namespace ChessPlaceSolverGUI {
     void MainForm::numericUpDown2_ValueChanged(System::Object^ Sender, System::EventArgs^ E)
     {
         BoardHeight = static_cast<int>(numericUpDown2->Value);
+
         int MaxPieces = CalcMaxPieces();
         numericUpDown1->Maximum = MaxPieces;
         if (numericUpDown1->Value > MaxPieces)
             numericUpDown1->Value = MaxPieces;
+
+        button5->Enabled = true;
     }
 
     void MainForm::numericUpDown3_ValueChanged(System::Object^ Sender, System::EventArgs^ E)
     {
         BoardWidth = static_cast<int>(numericUpDown3->Value);
+
         int MaxPieces = CalcMaxPieces();
         numericUpDown1->Maximum = MaxPieces;
         if (numericUpDown1->Value > MaxPieces)
             numericUpDown1->Value = MaxPieces;
+
+        button5->Enabled = true;
+    }
+
+    void MainForm::numericUpDown4_ValueChanged(System::Object^ Sender, System::EventArgs^ E)
+    {
+        MAXSolutions = static_cast<int>(numericUpDown4->Value);
+    }
+
+    void MainForm::UpdateLimitLabelUI()
+    {
+        String^ LimitedBy = (PendingMaxByCPU <= PendingMaxByRAM)
+            ? "CPU limited" : "RAM limited";
+
+        label10->Text = String::Format(
+            "Hardware Budget Analysis:\n"
+            "\n"
+            "RAM:\n"
+            "  Available      : {0} MB\n"
+            "  Budget (75%)   : {1} MB\n"
+            "  Per solution   : {2} bytes\n"
+            "  Max by RAM     : {3}\n"
+            "\n"
+            "CPU:\n"
+            "  Speed          : {4} MHz\n"
+            "  Sample rate    : {5:F0} solutions/sec\n"
+            "  Budget (40%)   : 12.0 sec of work\n"
+            "  Max by CPU     : {6}\n"
+            "\n"
+            "Recommended      : {7} ({8})",
+            PendingAvailableRAM,
+            static_cast<long long>(PendingAvailableRAM * 0.75),
+            PendingMemPerSol,
+            PendingMaxByRAM.ToString("N0"),
+            PendingCPUSpeed,
+            PendingRate,
+            PendingMaxByCPU.ToString("N0"),
+            PendingRecommended.ToString("N0"),
+            LimitedBy
+        );
+
+        numericUpDown4->Maximum = static_cast<Decimal>(
+            Math::Min(PendingRecommended, static_cast<long long>(Int32::MaxValue)));
+        numericUpDown4->Value = static_cast<Decimal>(PendingRecommended);
+        MAXSolutions = static_cast<int>(PendingRecommended);
+        button5->Enabled = true;
+    }
+
+    void MainForm::label10_MouseDown(System::Object^ Sender, System::Windows::Forms::MouseEventArgs^ E)
+    {
+        if (E->Button == System::Windows::Forms::MouseButtons::Left)
+        {
+            LabelDragging = true;
+            LabelDragOffset = System::Drawing::Point(E->X, E->Y);
+        }
+    }
+
+    void MainForm::label10_MouseMove(System::Object^ Sender, System::Windows::Forms::MouseEventArgs^ E)
+    {
+        if (!LabelDragging) return;
+
+        System::Drawing::Point ScreenPos = label10->PointToScreen(System::Drawing::Point(E->X, E->Y));
+        System::Drawing::Point FormPos = this->PointToClient(ScreenPos);
+
+        label10->Location = System::Drawing::Point(
+            FormPos.X - LabelDragOffset.X,
+            FormPos.Y - LabelDragOffset.Y);
+    }
+
+    void MainForm::label10_MouseUp(System::Object^ Sender, System::Windows::Forms::MouseEventArgs^ E)
+    {
+        LabelDragging = false;
     }
 
     void MainForm::textBox2_TextChanged(System::Object^ sender, System::EventArgs^ e) {}
